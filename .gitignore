@@ -1,0 +1,25 @@
+# Python Cache and Compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# Project specific folders
+uploads/*
+!uploads/.gitkeep
+interview_report_*.pdf
+
+# IDE configs
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp

@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Interview Bot - Practice Your Interview Skills</title>
+    
+    <!-- Third-party script dependencies -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface"></script>
+    
+    <!-- Custom external stylesheet -->
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Dashboard Header -->
+        <div class="header">
+            <h1>AI Interview Bot</h1>
+            <p>Practice your interview skills with AI-powered feedback</p>
+        </div>
+
+        <div class="content">
+            <!-- Step 1: Setup / Welcome Screen -->
+            <div id="step1" class="step active">
+                <h2 style="color: var(--neon-blue); margin-bottom: 20px; font-weight: 700; text-shadow: 0 0 10px rgba(0,242,254,0.15);">Welcome! Let's Get Started</h2>
+                
+                <!-- Proctoring Warning Details -->
+                <div class="warning-banner">
+                    <strong>⚠️ Proctoring Guidelines</strong>
+                    <ul>
+                        <li>Keep your face clearly visible to the camera at all times</li>
+                        <li>Only one person should be present in the camera frame</li>
+                        <li>Avoid switching browser tabs during the interview session</li>
+                        <li>Violations will be logged but will not instantly terminate your session</li>
+                        <li>Review the final report warnings to improve your practice</li>
+                    </ul>
+                </div>
+
+                <!-- Setup form wrapped in premium glass card -->
+                <div class="glass-card">
+                    <div class="form-group">
+                        <label for="apiKey">Google Gemini API Key</label>
+                        <input type="text" id="apiKey" placeholder="{% if has_default_key %}Using server configured key (optional){% else %}Enter your API key{% endif %}" {% if not has_default_key %}required{% endif %}>
+                        <small>Get your free API key from <a href="https://aistudio.google.com/" target="_blank">Google AI Studio</a></small>
+                    </div>
+
+                    <div class="voice-selector-wrapper">
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label for="voiceSelect">Select Interviewer Voice</label>
+                            <select id="voiceSelect">
+                                <option value="">Loading voices...</option>
+                            </select>
+                            <small>Choose your preferred interviewer voice</small>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="resume">Upload Your Resume (PDF or TXT)</label>
+                        <input type="file" id="resume" accept=".pdf,.txt" required>
+                        <small>The AI will ask questions tailored specifically to your experience, skills, and projects</small>
+                    </div>
+                </div>
+
+                <button class="btn" onclick="uploadResume()">Start Interview</button>
+            </div>
+
+            <!-- Step 2: Active Interview Console -->
+            <div id="step2" class="step">
+                <div class="auto-mode-indicator">
+                    <span>🤖</span>
+                    <div style="text-align: center;">
+                        <div>Automatic Conversation Mode Active</div>
+                        <small style="opacity: 0.8; font-size: 13px; font-weight: normal; margin-top: 4px;">Tip: Pause for 2 seconds after finishing your answer</small>
+                    </div>
+                </div>
+
+                <!-- Session Progress Bar -->
+                <div class="progress">
+                    <div id="progressBar" class="progress-bar" style="width: 0%"></div>
+                </div>
+
+                <!-- Main Interview Screen Grid -->
+                <div class="interview-layout">
+                    <!-- User Camera Feed Panel -->
+                    <div class="video-panel">
+                        <div class="panel-header">
+                            <span>👤</span>
+                            <span>Your Camera Feed</span>
+                        </div>
+                        <div class="video-container">
+                            <video id="userVideo" autoplay muted></video>
+                            <div id="securityIndicator" class="security-indicator">
+                                <span id="securityIcon">🔍</span>
+                                <span id="securityText">Initializing...</span>
+                            </div>
+                            <div id="violationCounter" class="violation-counter hidden">
+                                Warnings: <span id="violationCount">0</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- AI Interviewer Animated Avatar Panel -->
+                    <div class="video-panel">
+                        <div class="panel-header">
+                            <span>🤖</span>
+                            <span>AI Interviewer Hub</span>
+                        </div>
+                        <div class="video-container">
+                            <div class="bot-container">
+                                <div id="botAvatar" class="bot-avatar-large">🤖</div>
+                                <div id="botStatus" class="bot-status">Ready to start...</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Real-time Speech Transcription Status -->
+                <div id="recordingStatus" class="recording hidden">
+                    <div class="recording-header">
+                        <div class="recording-dot"></div>
+                        <span>Listening to your response...</span>
+                    </div>
+                    <div id="liveTranscript" class="recording-transcript">Start speaking...</div>
+                </div>
+
+                <!-- Chat history transcript -->
+                <div class="chat-box" id="chatBox"></div>
+
+                <!-- Hybrid Input Controls -->
+                <div class="input-panel glass-card">
+                    <div class="input-row">
+                        <button id="micToggleBtn" class="btn-icon" onclick="toggleMic()" title="Toggle Microphone">
+                            <span class="icon">🎤</span> <span class="btn-text">Active</span>
+                        </button>
+                        <input type="text" id="textResponseInput" placeholder="Type your response here..." onkeydown="handleInputKey(event)">
+                        <button id="sendResponseBtn" class="btn-send" onclick="submitTypedResponse()" title="Send Response">
+                            <span>➔</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Coding Challenge Block -->
+                <div id="codingChallengeBox" class="coding-challenge-box hidden">
+                    <div class="coding-challenge-header">
+                        <h3>💻 Coding Challenge</h3>
+                        <span id="codingLanguage" class="coding-language-badge">Python</span>
+                    </div>
+                    
+                    <div id="codingProblem" class="coding-problem">
+                        <!-- Problem details loaded here -->
+                    </div>
+
+                    <label style="display: block; margin-bottom: 12px; font-weight: 600;">Your Solution:</label>
+                    <textarea id="codeEditor" class="code-editor" placeholder="// Write your code here..."></textarea>
+
+                    <button class="btn code-submit-btn" onclick="submitCode()">Submit Code</button>
+
+                    <!-- Real-time Code Evaluation Results -->
+                    <div id="codeEvaluation" class="code-evaluation hidden">
+                        <h4 style="color: var(--neon-green); margin-bottom: 15px; font-weight: 700; font-size: 1.1rem; letter-spacing: 0.5px;">Evaluation Results</h4>
+                        <div class="code-scores">
+                            <div class="score-item">
+                                <div class="score-value" id="correctnessScore">0</div>
+                                <div class="score-label">Correctness</div>
+                            </div>
+                            <div class="score-item">
+                                <div class="score-value" id="qualityScore">0</div>
+                                <div class="score-label">Code Quality</div>
+                            </div>
+                            <div class="score-item">
+                                <div class="score-value" id="efficiencyScore">0</div>
+                                <div class="score-label">Efficiency</div>
+                            </div>
+                        </div>
+                        <div class="code-feedback" id="codeFeedback"></div>
+                    </div>
+                </div>
+
+                <div id="statusMessage" class="status hidden"></div>
+            </div>
+
+            <!-- Step 3: Complete & Feedback Screen -->
+            <div id="step3" class="step">
+                <h2 style="color: var(--neon-blue); font-weight: 700; text-shadow: 0 0 10px rgba(0,242,254,0.15);">Interview Complete!</h2>
+                <p style="margin: 20px 0; color: var(--text-secondary);">Thank you for completing the interview. Here is your detailed performance feedback:</p>
+
+                <div class="feedback-section" id="feedbackSection"></div>
+
+                <div style="margin-top: 36px; display: flex; gap: 16px;">
+                    <button class="btn" onclick="downloadReport()">Download PDF Report</button>
+                    <button class="btn" style="background: linear-gradient(135deg, var(--neon-cyan) 0%, var(--neon-blue) 100%); color: #05070e; box-shadow: 0 4px 15px rgba(0, 242, 254, 0.2);" onclick="location.reload()">New Interview Session</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom external script -->
+    <script src="/static/js/script.js"></script>
+</body>
+</html>
