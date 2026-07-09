@@ -1,5 +1,4 @@
 from flask import Flask, render_template, request, jsonify, send_file
-from flask_socketio import SocketIO, emit, join_room
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import os
@@ -12,7 +11,6 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 import io
-import threading
 import time
 import re
 import traceback
@@ -26,7 +24,6 @@ app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -40,8 +37,9 @@ SAFETY_SETTINGS = {
 }
 
 class InterviewSession:
-    def __init__(self, api_key, resume_text, session_id):
+    def __init__(self, api_key, resume_text, session_id, analyze=True):
         print(f"Initializing interview session: {session_id}")
+        self.api_key = api_key
         # Create a session-isolated API client to prevent concurrent session key pollution
         from google.ai import generativelanguage as glm
         client = glm.GenerativeServiceClient(client_options={'api_key': api_key})
@@ -76,6 +74,7 @@ class InterviewSession:
         if not self.model:
             print(f"CRITICAL: All models failed initialization. Last error details: {last_error}")
             raise last_error
+            
         self.resume_text = resume_text
         self.session_id = session_id
         self.conversation_history = []
@@ -84,7 +83,6 @@ class InterviewSession:
         self.resume_analysis = None
         self.asked_categories = set()
         self.asked_specific_items = set()
-        self.analysis_threads = []  # Track background evaluation threads
         
         # Coding challenge state
         self.coding_asked = False
@@ -105,10 +103,63 @@ class InterviewSession:
         self.proctoring_violations = []
         self.is_disqualified = False
         
-        print("Starting resume analysis...")
-        self._analyze_resume()
-        print(f"Resume analysis complete. Categories found: {list(self.resume_analysis.keys()) if self.resume_analysis else 'None'}")
+        if analyze:
+            print("Starting resume analysis...")
+            self._analyze_resume()
+            print(f"Resume analysis complete. Categories found: {list(self.resume_analysis.keys()) if self.resume_analysis else 'None'}")
         
+    @classmethod
+    def from_dict(cls, data):
+        """Restore InterviewSession from a dictionary (state)"""
+        session = cls(data['api_key'], data['resume_text'], data['session_id'], analyze=False)
+        session.conversation_history = data.get('conversation_history', [])
+        session.current_question = data.get('current_question', 0)
+        session.is_speaking = data.get('is_speaking', False)
+        session.resume_analysis = data.get('resume_analysis')
+        session.asked_categories = set(data.get('asked_categories', []))
+        session.asked_specific_items = set(data.get('asked_specific_items', []))
+        session.coding_asked = data.get('coding_asked', False)
+        session.knows_coding = data.get('knows_coding')
+        session.coding_language = data.get('coding_language')
+        session.coding_challenge_given = data.get('coding_challenge_given', False)
+        session.coding_question = data.get('coding_question')
+        session.coding_submission = data.get('coding_submission')
+        session.coding_template = data.get('coding_template', '')
+        session.scores = data.get('scores', {
+            'technical': 0,
+            'communication': 0,
+            'problem_solving': 0,
+            'confidence': 0,
+            'coding': 0
+        })
+        session.proctoring_violations = data.get('proctoring_violations', [])
+        session.is_disqualified = data.get('is_disqualified', False)
+        return session
+
+    def to_dict(self):
+        """Serialize InterviewSession to a dictionary (state)"""
+        return {
+            'api_key': self.api_key,
+            'resume_text': self.resume_text,
+            'session_id': self.session_id,
+            'conversation_history': self.conversation_history,
+            'current_question': self.current_question,
+            'is_speaking': self.is_speaking,
+            'resume_analysis': self.resume_analysis,
+            'asked_categories': list(self.asked_categories),
+            'asked_specific_items': list(self.asked_specific_items),
+            'coding_asked': self.coding_asked,
+            'knows_coding': self.knows_coding,
+            'coding_language': self.coding_language,
+            'coding_challenge_given': self.coding_challenge_given,
+            'coding_question': self.coding_question,
+            'coding_submission': self.coding_submission,
+            'coding_template': self.coding_template,
+            'scores': self.scores,
+            'proctoring_violations': self.proctoring_violations,
+            'is_disqualified': self.is_disqualified
+        }
+
     def _analyze_resume(self):
         """Deep analysis of resume to extract all key areas"""
         prompt = f"""Analyze this resume and extract ALL key areas for interview questions:
@@ -361,7 +412,7 @@ Give a warm, professional greeting (2-3 sentences). Mention specific impressive 
             strategy_prompt = "Ask a thoughtful follow-up."
         
         available_items = []
-        if strategy_category in self.resume_analysis:
+        if self.resume_analysis and strategy_category in self.resume_analysis:
             all_items = self.resume_analysis[strategy_category]
             available_items = [item for item in all_items if item not in self.asked_specific_items]
             
@@ -418,7 +469,7 @@ Confidence: [score]"""
                     self.scores['problem_solving'] += int(scores[2])
                     self.scores['confidence'] += int(scores[3])
         except Exception as e:
-            print(f"Error in background analyze_response thread: {e}")
+            print(f"Error in analyze_response scoring: {e}")
 
     def log_violation(self, violation_type, details):
         """Log proctoring violation"""
@@ -433,11 +484,6 @@ Confidence: [score]"""
         """Generate comprehensive feedback"""
         print("Generating feedback...")
         
-        # Wait for all background analysis threads to finish before generating report
-        for t in self.analysis_threads:
-            if t.is_alive():
-                t.join()
-                
         responses = [h['content'] for h in self.conversation_history if h['role'] == 'Candidate']
         responses_text = "\n\n".join([f"Q{i+1}: {r[:200]}" for i, r in enumerate(responses)])
         
@@ -510,9 +556,6 @@ KEY TAKEAWAYS:
         
         return self.generate_content(prompt)
 
-# Active sessions
-sessions = {}
-
 @app.route('/')
 def index():
     has_default_key = bool(os.environ.get('GEMINI_API_KEY'))
@@ -520,7 +563,7 @@ def index():
 
 @app.route('/upload_resume', methods=['POST'])
 def upload_resume():
-    """Handle resume upload"""
+    """Handle resume upload, construct initial session state"""
     try:
         print("\n=== UPLOAD RESUME ===")
         
@@ -557,17 +600,18 @@ def upload_resume():
                 with open(filepath, 'r', encoding='utf-8') as f:
                     resume_text = f.read()
         finally:
-            os.remove(filepath)
+            if os.path.exists(filepath):
+                os.remove(filepath)
         
         if len(resume_text.strip()) < 50:
             return jsonify({'error': 'Resume too short'}), 400
         
         session_id = secrets.token_hex(16)
-        sessions[session_id] = InterviewSession(api_key, resume_text, session_id)
+        interview = InterviewSession(api_key, resume_text, session_id, analyze=True)
         
         return jsonify({
             'success': True,
-            'session_id': session_id,
+            'session_state': interview.to_dict(),
             'message': 'Resume uploaded! Starting interview...'
         })
         
@@ -576,179 +620,159 @@ def upload_resume():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-@socketio.on('connect')
-def handle_connect():
-    print(f"\n=== CONNECTED: {request.sid} ===")
-    emit('connected', {'status': 'ready'})
-
-@socketio.on('join_interview')
-def handle_join(data):
-    """Join interview"""
-    print(f"\n=== JOIN INTERVIEW ===")
-    session_id = data.get('session_id')
-    
-    if session_id not in sessions:
-        emit('error', {'message': 'Invalid session'})
-        return
-    
-    join_room(session_id)
-    interview = sessions[session_id]
-    
-    emit('bot_status', {'status': 'thinking'}, room=session_id)
-    time.sleep(0.5)
-    
+@app.route('/api/join_interview', methods=['POST'])
+def join_interview():
+    """Start interview, returns the introduction"""
     try:
+        data = request.json or {}
+        state = data.get('session_state')
+        if not state:
+            return jsonify({'error': 'Missing session_state'}), 400
+            
+        interview = InterviewSession.from_dict(state)
         intro = interview.get_introduction()
+        
         if intro:
             interview.conversation_history.append({
                 'role': 'Interviewer',
                 'content': intro,
                 'timestamp': datetime.now().isoformat()
             })
-            
-            emit('bot_message', {
-                'message': intro,
-                'question_number': 0,
-                'total_questions': TOTAL_QUESTIONS,
-                'auto_listen': True
-            }, room=session_id)
+            return jsonify({
+                'success': True,
+                'session_state': interview.to_dict(),
+                'intro': intro,
+                'total_questions': TOTAL_QUESTIONS
+            })
         else:
-            emit('error', {'message': 'Failed to generate introduction'})
+            return jsonify({'error': 'Failed to generate introduction'}), 500
+            
     except Exception as e:
         err_msg = str(e)
+        print(f"!!! Error in join_interview: {err_msg}")
+        traceback.print_exc()
         if "quota" in err_msg.lower() or "429" in err_msg.lower() or "limit" in err_msg.lower():
-            emit('error', {'message': 'Google Gemini API Quota Limit Exceeded (429). Please verify your API key limits or try again later.'})
-        else:
-            emit('error', {'message': f'API Error during startup: {err_msg}'})
+            return jsonify({'error': 'Google Gemini API Quota Limit Exceeded (429). Please verify your API key limits.'}), 429
+        return jsonify({'error': f'API Error during startup: {err_msg}'}), 500
 
-@socketio.on('user_response')
-def handle_user_response(data):
-    """Process response"""
-    print(f"\n=== USER RESPONSE ===")
-    session_id = data.get('session_id')
-    response_text = data.get('response', '').strip()
-    
-    if session_id not in sessions or not response_text:
-        emit('error', {'message': 'Invalid'})
-        return
-    
-    interview = sessions[session_id]
-    
-    if interview.is_disqualified:
-        emit('error', {'message': 'Terminated'})
-        return
-    
-    # Check if this is response to "do you know coding?"
-    if interview.coding_asked and interview.knows_coding is None:
-        response_lower = response_text.lower()
-        if 'yes' in response_lower or 'python' in response_lower or 'java' in response_lower or 'javascript' in response_lower or 'c++' in response_lower:
-            interview.knows_coding = True
-            # Extract language
-            for lang in ['python', 'java', 'javascript', 'c++', 'c#', 'ruby', 'go']:
-                if lang in response_lower:
-                    interview.coding_language = lang.title()
-                    break
-            if not interview.coding_language:
-                interview.coding_language = "Python"
-            print(f"User knows coding: {interview.coding_language}")
-        else:
-            interview.knows_coding = False
-            print("User doesn't know coding")
-    
-    interview.conversation_history.append({
-        'role': 'Candidate',
-        'content': response_text,
-        'timestamp': datetime.now().isoformat()
-    })
-    
-    t = threading.Thread(target=interview.analyze_response, args=(response_text,))
-    interview.analysis_threads.append(t)
-    t.start()
-    
-    emit('bot_status', {'status': 'thinking'}, room=session_id)
-    time.sleep(0.8)
-    
+@app.route('/api/submit_response', methods=['POST'])
+def submit_response():
+    """Process user response and return next question or feedback"""
     try:
+        data = request.json or {}
+        state = data.get('session_state')
+        response_text = data.get('response', '').strip()
+        
+        if not state or not response_text:
+            return jsonify({'error': 'Missing session_state or response'}), 400
+            
+        interview = InterviewSession.from_dict(state)
+        
+        if interview.is_disqualified:
+            return jsonify({'error': 'Interview terminated due to proctoring disqualification.'}), 400
+            
+        # Check if this is response to "do you know coding?"
+        if interview.coding_asked and interview.knows_coding is None:
+            response_lower = response_text.lower()
+            if any(w in response_lower for w in ['yes', 'python', 'java', 'javascript', 'c++', 'c#', 'ruby', 'go']):
+                interview.knows_coding = True
+                # Extract language
+                for lang in ['python', 'java', 'javascript', 'c++', 'c#', 'ruby', 'go']:
+                    if lang in response_lower:
+                        interview.coding_language = lang.title()
+                        break
+                if not interview.coding_language:
+                    interview.coding_language = "Python"
+                print(f"User knows coding: {interview.coding_language}")
+            else:
+                interview.knows_coding = False
+                print("User doesn't know coding")
+                
+        interview.conversation_history.append({
+            'role': 'Candidate',
+            'content': response_text,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Analyze response synchronously
+        interview.analyze_response(response_text)
+        
+        # If client reports disqualification flags or we detect it
+        if state.get('is_disqualified'):
+            interview.is_disqualified = True
+            
         if interview.current_question >= TOTAL_QUESTIONS:
             print("Interview complete!")
-            emit('bot_status', {'status': 'analyzing'}, room=session_id)
-            
             feedback = interview.generate_feedback()
-            
             if feedback:
                 interview.conversation_history.append({
                     'role': 'Feedback',
                     'content': feedback,
                     'timestamp': datetime.now().isoformat()
                 })
-                
-                emit('interview_complete', {'feedback': feedback}, room=session_id)
+                return jsonify({
+                    'status': 'complete',
+                    'session_state': interview.to_dict(),
+                    'feedback': feedback
+                })
             else:
-                emit('error', {'message': 'Failed to generate feedback report'})
-            return
-        
+                return jsonify({'error': 'Failed to generate feedback report'}), 500
+                
         next_question = interview.get_question(response_text)
         
-        # Check if coding challenge
+        # Check if coding challenge should be given
         if next_question is None and interview.coding_challenge_given and not interview.coding_submission:
-            print("Emitting coding challenge...")
+            print("Generating coding challenge...")
             challenge = interview.generate_coding_challenge()
             if challenge:
-                emit('coding_challenge', {
+                return jsonify({
+                    'status': 'coding_challenge',
+                    'session_state': interview.to_dict(),
                     'challenge': challenge,
                     'language': interview.coding_language,
                     'template': interview.coding_template,
                     'question_number': interview.current_question,
                     'total_questions': TOTAL_QUESTIONS
-                }, room=session_id)
+                })
             else:
-                print("ERROR: Coding challenge generation failed!")
-                emit('error', {'message': 'Failed to generate coding challenge'}, room=session_id)
-            return
-        
+                return jsonify({'error': 'Failed to generate coding challenge'}), 500
+                
         if next_question:
             interview.conversation_history.append({
                 'role': 'Interviewer',
                 'content': next_question,
                 'timestamp': datetime.now().isoformat()
             })
-            
-            emit('bot_message', {
+            return jsonify({
+                'status': 'question',
+                'session_state': interview.to_dict(),
                 'message': next_question,
                 'question_number': interview.current_question,
-                'total_questions': TOTAL_QUESTIONS,
-                'auto_listen': True
-            }, room=session_id)
+                'total_questions': TOTAL_QUESTIONS
+            })
         else:
-            emit('error', {'message': 'Failed to generate next question'})
+            return jsonify({'error': 'Failed to generate next question'}), 500
+            
     except Exception as e:
         err_msg = str(e)
+        print(f"!!! Error in submit_response: {err_msg}")
+        traceback.print_exc()
         if "quota" in err_msg.lower() or "429" in err_msg.lower() or "limit" in err_msg.lower():
-            emit('error', {'message': 'Google Gemini API Quota Limit Exceeded (429). Please wait a minute or check your key limits.'})
-        else:
-            emit('error', {'message': f'API Error during response processing: {err_msg}'})
+            return jsonify({'error': 'Google Gemini API Quota Limit Exceeded (429). Please verify your API key limits.'}), 429
+        return jsonify({'error': f'API Error during response processing: {err_msg}'}), 500
 
-@socketio.on('submit_code')
-def handle_code_submission(data):
-    """Handle code submission"""
-    print(f"\n=== CODE SUBMISSION ===")
-    session_id = data.get('session_id')
-    code = data.get('code', '').strip()
-    
-    if session_id not in sessions:
-        emit('error', {'message': 'Invalid session'})
-        return
-    
-    interview = sessions[session_id]
-    
-    if not code:
-        emit('error', {'message': 'Empty code'})
-        return
-    
-    emit('bot_status', {'status': 'evaluating'}, room=session_id)
-    time.sleep(1)
-    
+@app.route('/api/submit_code', methods=['POST'])
+def submit_code():
+    """Handle coding challenge submission"""
     try:
+        data = request.json or {}
+        state = data.get('session_state')
+        code = data.get('code', '').strip()
+        
+        if not state or not code:
+            return jsonify({'error': 'Missing session_state or code'}), 400
+            
+        interview = InterviewSession.from_dict(state)
         evaluation = interview.evaluate_code_submission(code)
         interview.coding_submission = evaluation
         
@@ -764,19 +788,7 @@ def handle_code_submission(data):
             'timestamp': datetime.now().isoformat()
         })
         
-        emit('code_evaluation', {
-            'score': evaluation['score'],
-            'feedback': evaluation['feedback'],
-            'correctness': evaluation.get('correctness', 0),
-            'quality': evaluation.get('quality', 0),
-            'efficiency': evaluation.get('efficiency', 0)
-        }, room=session_id)
-        
-        # Continue after 2 seconds
-        time.sleep(2)
-        emit('bot_status', {'status': 'thinking'}, room=session_id)
-        time.sleep(0.5)
-        
+        # Get next question
         next_question = interview.get_question()
         if next_question:
             interview.conversation_history.append({
@@ -785,42 +797,41 @@ def handle_code_submission(data):
                 'timestamp': datetime.now().isoformat()
             })
             
-            emit('bot_message', {
-                'message': next_question,
+            return jsonify({
+                'success': True,
+                'session_state': interview.to_dict(),
+                'evaluation': {
+                    'score': evaluation['score'],
+                    'feedback': evaluation['feedback'],
+                    'correctness': evaluation.get('correctness', 0),
+                    'quality': evaluation.get('quality', 0),
+                    'efficiency': evaluation.get('efficiency', 0)
+                },
+                'next_question': next_question,
                 'question_number': interview.current_question,
-                'total_questions': TOTAL_QUESTIONS,
-                'auto_listen': True
-            }, room=session_id)
+                'total_questions': TOTAL_QUESTIONS
+            })
+        else:
+            return jsonify({'error': 'Failed to generate next question after code submission'}), 500
+            
     except Exception as e:
         err_msg = str(e)
+        print(f"!!! Error in submit_code: {err_msg}")
+        traceback.print_exc()
         if "quota" in err_msg.lower() or "429" in err_msg.lower() or "limit" in err_msg.lower():
-            emit('error', {'message': 'Google Gemini API Quota Limit Exceeded (429). Please verify your key limits or try again.'})
-        else:
-            emit('error', {'message': f'API Error during code evaluation: {err_msg}'})
+            return jsonify({'error': 'Google Gemini API Quota Limit Exceeded (429). Please verify your API key limits.'}), 429
+        return jsonify({'error': f'API Error during code evaluation: {err_msg}'}), 500
 
-@socketio.on('proctoring_violation')
-def handle_violation(data):
-    """Handle violations"""
-    session_id = data.get('session_id')
-    violation_type = data.get('type')
-    details = data.get('details')
-    
-    if session_id in sessions:
-        interview = sessions[session_id]
-        interview.log_violation(violation_type, details)
-        
-        if violation_type in ['multiple_people', 'disqualified']:
-            interview.is_disqualified = True
-            emit('disqualify', {'reason': details}, room=session_id)
-
-@app.route('/download_report/<session_id>')
-def download_report(session_id):
-    """Download PDF report"""
+@app.route('/api/download_report', methods=['POST'])
+def download_report():
+    """Stateless download of PDF report"""
     try:
-        if session_id not in sessions:
-            return "Invalid session", 400
-        
-        interview = sessions[session_id]
+        data = request.json or {}
+        state = data.get('session_state')
+        if not state:
+            return "Missing session_state", 400
+            
+        interview = InterviewSession.from_dict(state)
         
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
@@ -855,7 +866,12 @@ def download_report(session_id):
         doc.build(story)
         buffer.seek(0)
         
-        return send_file(buffer, as_attachment=True, download_name=f'interview_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf', mimetype='application/pdf')
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=f'interview_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf',
+            mimetype='application/pdf'
+        )
         
     except Exception as e:
         print(f"!!! Report error: {e}")
@@ -863,6 +879,6 @@ def download_report(session_id):
 
 if __name__ == '__main__':
     print("\n" + "="*50)
-    print("STARTING AI INTERVIEW BOT SERVER")
+    print("STARTING STATALESS AI INTERVIEW BOT SERVER")
     print("="*50 + "\n")
-    socketio.run(app, debug=True, host='127.0.0.1', port=5000, allow_unsafe_werkzeug=True)
+    app.run(debug=True, host='127.0.0.1', port=5000)

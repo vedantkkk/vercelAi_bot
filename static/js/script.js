@@ -1,4 +1,4 @@
-let socket = null;
+let sessionState = null;
 let sessionId = null;
 let currentQuestion = 0;
 let totalQuestions = 8;
@@ -168,12 +168,24 @@ function logViolation(type, details) {
     violations++;
     updateViolationCounter();
     
-    if (socket && sessionId) {
-        socket.emit('proctoring_violation', {
-            session_id: sessionId,
+    if (sessionState) {
+        if (!sessionState.proctoring_violations) {
+            sessionState.proctoring_violations = [];
+        }
+        sessionState.proctoring_violations.push({
             type: type,
-            details: details
+            details: details,
+            timestamp: new Date().toISOString()
         });
+        
+        if (type === 'multiple_people' || type === 'disqualified') {
+            sessionState.is_disqualified = true;
+            isInterviewActive = false;
+            isAutoMode = false;
+            clearInterval(faceCheckInterval);
+            showStatus('Interview terminated due to proctoring violation.', 'error');
+            showStep(3);
+        }
     }
 }
 
@@ -287,12 +299,13 @@ async function uploadResume() {
         const data = await response.json();
 
         if (data.success) {
-            sessionId = data.session_id;
+            sessionState = data.session_state;
+            sessionId = sessionState.session_id;
             showStatus('Resume analyzed! Starting interview...', 'success');
             setTimeout(() => {
                 showStep(2);
                 initCamera();
-                connectSocket();
+                startInterview();
             }, 1500);
         } else {
             showStatus(data.error || 'Upload failed', 'error');
@@ -302,87 +315,40 @@ async function uploadResume() {
     }
 }
 
-function connectSocket() {
-    socket = io();
-
-    socket.on('connect', () => {
-        socket.emit('join_interview', { session_id: sessionId });
-    });
-
-    socket.on('bot_status', (data) => {
-        if (data.status === 'thinking') {
-            updateBotStatus('ready', 'Thinking...');
-        } else if (data.status === 'analyzing') {
-            updateBotStatus('ready', 'Analyzing...');
-        } else if (data.status === 'evaluating') {
-            updateBotStatus('ready', 'Evaluating code...');
-        }
-    });
-
-    socket.on('bot_message', (data) => {
-        isProcessingResponse = false;
-        addMessage('Interviewer', data.message);
-        currentQuestion = data.question_number;
-        totalQuestions = data.total_questions;
-        updateProgress();
-        const statusMsg = document.getElementById('statusMessage');
-        if (statusMsg) statusMsg.classList.add('hidden');
+async function startInterview() {
+    updateBotStatus('ready', 'Thinking...');
+    
+    try {
+        const response = await fetch('/api/join_interview', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ session_state: sessionState })
+        });
         
-        speakText(data.message, true);
-    });
-
-    socket.on('coding_challenge', (data) => {
-        console.log('Coding challenge received');
-        const challengeBox = document.getElementById('codingChallengeBox');
-        if (challengeBox) {
-            challengeBox.classList.remove('hidden');
-            document.getElementById('codingLanguage').textContent = data.language || 'Python';
-            document.getElementById('codingProblem').textContent = data.challenge;
+        const data = await response.json();
+        
+        if (response.ok && data.success) {
+            sessionState = data.session_state;
+            isProcessingResponse = false;
+            addMessage('Interviewer', data.intro);
+            currentQuestion = 0;
+            totalQuestions = data.total_questions;
+            updateProgress();
             
-            // Pre-fill code editor with function template
-            const template = data.template || getDefaultTemplate(data.language);
-            document.getElementById('codeEditor').value = template;
+            const statusMsg = document.getElementById('statusMessage');
+            if (statusMsg) statusMsg.classList.add('hidden');
             
-            document.getElementById('codeEvaluation').classList.add('hidden');
-            challengeBox.scrollIntoView({ behavior: 'smooth' });
+            speakText(data.intro, true);
+        } else {
+            showStatus(data.error || 'Failed to start interview', 'error');
+            updateBotStatus('ready', 'Failed to start');
         }
-        
-        speakText('Please solve the coding challenge. Complete the function and submit when ready.', false);
-    });
-
-    socket.on('code_evaluation', (data) => {
-        document.getElementById('correctnessScore').textContent = data.correctness || data.score;
-        document.getElementById('qualityScore').textContent = data.quality || data.score;
-        document.getElementById('efficiencyScore').textContent = data.efficiency || data.score;
-        document.getElementById('codeFeedback').textContent = data.feedback;
-        
-        const codeEval = document.getElementById('codeEvaluation');
-        if (codeEval) codeEval.classList.remove('hidden');
-        
-        speakText('Code evaluated. Continuing with next question.', false);
-        
-        setTimeout(() => {
-            const challengeBox = document.getElementById('codingChallengeBox');
-            if (challengeBox) challengeBox.classList.add('hidden');
-        }, 5000);
-    });
-
-    socket.on('interview_complete', (data) => {
-        isInterviewActive = false;
-        isAutoMode = false;
-        clearInterval(faceCheckInterval);
-        addMessage('Feedback', data.feedback);
-        speakText('Interview complete. Please review your feedback.');
-        setTimeout(() => {
-            showFeedback(data.feedback);
-            showStep(3);
-        }, 3000);
-    });
-
-    socket.on('error', (data) => {
-        showStatus(data.message, 'error');
-        isProcessingResponse = false;
-    });
+    } catch (error) {
+        showStatus('API connection error: ' + error.message, 'error');
+        updateBotStatus('ready', 'Connection failed');
+    }
 }
 
 function speakText(text, autoListen = false) {
@@ -517,18 +483,82 @@ function startAutoResponse() {
     }
 }
 
-function submitResponse(response) {
-    if (socket && sessionId && response.trim()) {
-        socket.emit('user_response', {
-            session_id: sessionId,
-            response: response.trim()
-        });
-    } else {
+async function submitResponse(response) {
+    if (!sessionState || !response.trim()) {
         isProcessingResponse = false;
+        return;
+    }
+    
+    updateBotStatus('ready', 'Thinking...');
+    
+    try {
+        const res = await fetch('/api/submit_response', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                session_state: sessionState,
+                response: response.trim()
+            })
+        });
+        
+        const data = await res.json();
+        
+        if (!res.ok) {
+            showStatus(data.error || 'Error submitting response', 'error');
+            isProcessingResponse = false;
+            updateBotStatus('ready', 'Ready');
+            return;
+        }
+        
+        sessionState = data.session_state;
+        isProcessingResponse = false;
+        
+        const statusMsg = document.getElementById('statusMessage');
+        if (statusMsg) statusMsg.classList.add('hidden');
+        
+        if (data.status === 'complete') {
+            isInterviewActive = false;
+            isAutoMode = false;
+            clearInterval(faceCheckInterval);
+            addMessage('Feedback', data.feedback);
+            speakText('Interview complete. Please review your feedback.');
+            setTimeout(() => {
+                showFeedback(data.feedback);
+                showStep(3);
+            }, 3000);
+        } else if (data.status === 'coding_challenge') {
+            console.log('Coding challenge received');
+            const challengeBox = document.getElementById('codingChallengeBox');
+            if (challengeBox) {
+                challengeBox.classList.remove('hidden');
+                document.getElementById('codingLanguage').textContent = data.language || 'Python';
+                document.getElementById('codingProblem').textContent = data.challenge;
+                
+                // Pre-fill code editor with function template
+                const template = data.template || getDefaultTemplate(data.language);
+                document.getElementById('codeEditor').value = template;
+                
+                document.getElementById('codeEvaluation').classList.add('hidden');
+                challengeBox.scrollIntoView({ behavior: 'smooth' });
+            }
+            speakText('Please solve the coding challenge. Complete the function and submit when ready.', false);
+        } else if (data.status === 'question') {
+            addMessage('Interviewer', data.message);
+            currentQuestion = data.question_number;
+            totalQuestions = data.total_questions;
+            updateProgress();
+            speakText(data.message, true);
+        }
+    } catch (error) {
+        showStatus('Connection error: ' + error.message, 'error');
+        isProcessingResponse = false;
+        updateBotStatus('ready', 'Ready');
     }
 }
 
-function submitCode() {
+async function submitCode() {
     const code = document.getElementById('codeEditor').value.trim();
     
     if (!code) {
@@ -537,11 +567,57 @@ function submitCode() {
     }
     
     addMessage('Candidate', '[Code Submitted]');
+    updateBotStatus('ready', 'Evaluating code...');
     
-    socket.emit('submit_code', {
-        session_id: sessionId,
-        code: code
-    });
+    try {
+        const res = await fetch('/api/submit_code', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                session_state: sessionState,
+                code: code
+            })
+        });
+        
+        const data = await res.json();
+        
+        if (!res.ok) {
+            showStatus(data.error || 'Error evaluating code', 'error');
+            updateBotStatus('ready', 'Evaluation failed');
+            return;
+        }
+        
+        sessionState = data.session_state;
+        
+        document.getElementById('correctnessScore').textContent = data.evaluation.correctness || data.evaluation.score;
+        document.getElementById('qualityScore').textContent = data.evaluation.quality || data.evaluation.score;
+        document.getElementById('efficiencyScore').textContent = data.evaluation.efficiency || data.evaluation.score;
+        document.getElementById('codeFeedback').textContent = data.evaluation.feedback;
+        
+        const codeEval = document.getElementById('codeEvaluation');
+        if (codeEval) codeEval.classList.remove('hidden');
+        
+        speakText('Code evaluated. Continuing with next question.', false);
+        
+        setTimeout(() => {
+            const challengeBox = document.getElementById('codingChallengeBox');
+            if (challengeBox) challengeBox.classList.add('hidden');
+        }, 5000);
+        
+        setTimeout(() => {
+            addMessage('Interviewer', data.next_question);
+            currentQuestion = data.question_number;
+            totalQuestions = data.total_questions;
+            updateProgress();
+            speakText(data.next_question, true);
+        }, 2000);
+        
+    } catch (error) {
+        showStatus('Connection error: ' + error.message, 'error');
+        updateBotStatus('ready', 'Connection failed');
+    }
 }
 
 function addMessage(role, content) {
@@ -585,6 +661,7 @@ function showStep(stepNumber) {
     }
 }
 
+// Global function to display errors/status banners
 function showStatus(message, type) {
     const statusDiv = document.getElementById('statusMessage');
     if (!statusDiv) return;
@@ -602,9 +679,37 @@ function showFeedback(feedback) {
     if (feedbackSec) feedbackSec.textContent = feedback;
 }
 
-function downloadReport() {
-    if (sessionId) {
-        window.location.href = `/download_report/${sessionId}`;
+async function downloadReport() {
+    if (!sessionState) {
+        showStatus('No interview session active to download report', 'error');
+        return;
+    }
+    try {
+        showStatus('Generating PDF report...', 'info');
+        const response = await fetch('/api/download_report', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ session_state: sessionState })
+        });
+        
+        if (!response.ok) {
+            throw new Error('Failed to generate report PDF');
+        }
+        
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `interview_report_${new Date().toISOString().slice(0,10)}.pdf`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+        showStatus('Report downloaded successfully!', 'success');
+    } catch (error) {
+        showStatus('Error downloading report: ' + error.message, 'error');
     }
 }
 
