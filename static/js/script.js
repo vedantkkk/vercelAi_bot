@@ -351,11 +351,15 @@ async function startInterview() {
     }
 }
 
+// Persistent reference to prevent Chrome garbage collection bug on SpeechSynthesisUtterance
+window.activeUtterances = window.activeUtterances || [];
+
 function speakText(text, autoListen = false) {
     synth.cancel();
     updateBotStatus('speaking', 'Speaking...');
     
     const utterance = new SpeechSynthesisUtterance(text);
+    window.activeUtterances.push(utterance);
     
     if (selectedVoice) {
         utterance.voice = selectedVoice;
@@ -363,6 +367,8 @@ function speakText(text, autoListen = false) {
     utterance.rate = speechRate;
     
     utterance.onend = () => {
+        // Remove from memory
+        window.activeUtterances = window.activeUtterances.filter(u => u !== utterance);
         updateBotStatus('ready', 'Ready');
         
         if (autoListen && isAutoMode && isInterviewActive && !isProcessingResponse) {
@@ -381,6 +387,21 @@ function speakText(text, autoListen = false) {
                     }
                 }, 800);
             }
+        }
+    };
+    
+    utterance.onerror = (event) => {
+        console.error('SpeechSynthesisUtterance error:', event);
+        window.activeUtterances = window.activeUtterances.filter(u => u !== utterance);
+        updateBotStatus('ready', 'Ready');
+        
+        // Fallback to listening even if SpeechSynthesis fails
+        if (autoListen && isAutoMode && isInterviewActive && !isProcessingResponse) {
+            setTimeout(() => {
+                if (!isProcessingResponse) {
+                    startAutoResponse();
+                }
+            }, 800);
         }
     };
     
