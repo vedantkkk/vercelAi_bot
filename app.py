@@ -22,7 +22,11 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
-app.config['UPLOAD_FOLDER'] = 'uploads'
+# Set writable directory for serverless (Vercel has read-only filesystem except for /tmp)
+if os.environ.get('VERCEL') or os.name != 'nt':
+    app.config['UPLOAD_FOLDER'] = '/tmp'
+else:
+    app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
