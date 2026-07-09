@@ -302,9 +302,9 @@ async function uploadResume() {
             sessionState = data.session_state;
             sessionId = sessionState.session_id;
             showStatus('Resume analyzed! Starting interview...', 'success');
-            setTimeout(() => {
+            setTimeout(async () => {
                 showStep(2);
-                initCamera();
+                await initCamera();
                 startInterview();
             }, 1500);
         } else {
